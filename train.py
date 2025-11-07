@@ -16,8 +16,10 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
     running_loss = 0.0
     running_corrects = 0
 
-    # Determine dataset size (works for SubsetRandomSampler)
-    dataset_size = len(dataloader.dataset.indices)
+    # --- THIS IS THE FIX ---
+    # The dataset size is determined by the sampler's indices, not the dataset's
+    dataset_size = len(dataloader.sampler.indices)
+    # --- END FIX ---
 
     for inputs, labels in dataloader:
         inputs = inputs.to(device)
@@ -131,10 +133,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train RGB-SClusterFormer model.')
     parser.add_argument('--data_path', type=str, default="/kaggle/input/apple-disease-dataset/datasets",
                         help='Path to the dataset directory (must contain train/ and test/ folders).')
-    
-    # --- THIS LINE IS NOW FIXED ---
     parser.add_argument('--img_size', type=int, default=224, help='Input image size.')
-    
     parser.add_argument('--batch_size', type=int, default=32, help='Training batch size.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for optimizer.')
