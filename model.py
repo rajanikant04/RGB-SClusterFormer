@@ -171,7 +171,12 @@ class Cluster2D(nn.Module):
         self.rule2 = nn.Sequential(nn.LeakyReLU(0.2, inplace=True), nn.Dropout(0.4))
 
     def forward(self, x):
-        x = rearrange(x, "b (w h) c -> b c w h", w=self.patch_size, h=self.patch_size)
+        # We need to know the original H, W
+        B, N, C = x.shape
+        H = W = int(math.sqrt(N)) # Assumes square feature map
+        
+        x = rearrange(x, "b (w h) c -> b c w h", w=W, h=H)
+        
         value = self.v(x)
         x = self.f(x)
         x = rearrange(x, "b (e c) w h -> (b e) c w h", e=self.heads)
@@ -203,6 +208,8 @@ class Cluster2D(nn.Module):
             out = rearrange(out, "(b f1 f2) c w h -> b c (f1 w) (f2 h)", f1=self.fold_w, f2=self.fold_h)
         out = rearrange(out, "(b e) c w h -> b (e c) w h", e=self.heads)
         out = self.proj(out)
+        
+        # Re-arrange back to token format
         out = rearrange(out, "b c w h -> b (w h) c")
         return out
 
@@ -227,6 +234,7 @@ class Block2D(nn.Module):
     def __init__(self, patch_size, dim, num_heads, mlp_ratio=4, drop=0.):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
+        # We pass patch_size, but Cluster2D will recalculate it
         self.attn = Cluster2D(patch_size=patch_size, dim=dim, out_dim=dim, proposal_w=4, proposal_h=4, fold_w=1, fold_h=1, heads=num_heads, head_dim=24)
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -239,6 +247,7 @@ class Block2D(nn.Module):
 
 
 class MultiScaleDeformConv2D(nn.Module):
+    # THIS MODULE IS KEPT BUT IS NO LONGER USED BY DEFAULT
     def __init__(self, deform_conv: nn.Module, kernel_sizes=[3, 5, 7]):
         super().__init__()
         self.kernel_sizes = kernel_sizes
@@ -273,27 +282,56 @@ class RGB_SClusterFormer(nn.Module):
         super().__init__()
         self.num_stages = num_stages
         
-        deform_conv_shared_rgb = DeformConv2d(inc=in_chans, outc=30, kernel_size=9, padding=1, bias=False, modulation=True)
-        self.deform_conv_layer_rgb = MultiScaleDeformConv2D(deform_conv_shared_rgb)
+        # ---
+        # OOM FIX:
+        # 1. Changed kernel_size=9 to kernel_size=3.
+        # 2. Removed the MultiScaleDeformConv2D wrapper from the stem.
+        # ---
+        self.deform_conv_stem = DeformConv2d(
+            inc=in_chans, 
+            outc=30, 
+            kernel_size=3,  # Was 9
+            padding=1, 
+            bias=False, 
+            modulation=True
+        )
         
         stem_out_channels = 30 
-        self.embed_img = [img_size, math.ceil(img_size / 2), math.ceil(math.ceil(img_size / 2) / 2)]
+        
+        """Main Hierarchical Branch (adapted from Lower Branch)"""
+        # Calculate feature map sizes
+        self.embed_img = []
+        current_size = img_size
+        self.embed_img.append(current_size) # Stage 1 size
+        current_size = math.ceil(current_size / 2)
+        self.embed_img.append(current_size) # Stage 2 size
+        current_size = math.ceil(current_size / 2)
+        self.embed_img.append(current_size) # Stage 3 size
+
         
         for i in range(num_stages):
             patch_embed2d = PixelEmbedding(
-                in_feature_map_size=img_size if i == 0 else self.embed_img[i - 1],
+                in_feature_map_size=self.embed_img[i],
                 in_chans=stem_out_channels if i == 0 else embed_dims[i - 1],
                 embed_dim=embed_dims[i],
                 i=i
             )
+
             block2d = nn.ModuleList([Block2D(
-                dim=embed_dims[i], num_heads=num_heads[i], mlp_ratio=mlp_ratios[i],
-                drop=0., patch_size=self.embed_img[i]) for j in range(depths[i])])
+                dim=embed_dims[i], 
+                num_heads=num_heads[i], 
+                mlp_ratio=mlp_ratios[i],
+                drop=0., 
+                patch_size=self.embed_img[i+1] if i < num_stages - 1 else self.embed_img[i] # Pass the *next* stage's patch size
+            ) for j in range(depths[i])])
+
             norm = nn.LayerNorm(embed_dims[i])
+
             setattr(self, f"patch_embed2d{i + 1}", patch_embed2d)
             setattr(self, f"block2d{i + 1}", block2d)
             setattr(self, f"norm2d{i + 1}", norm)
             
+        """Classification Head"""
         self.head = nn.Linear(embed_dims[-1], num_classes)
 
     def forward_features(self, x):
@@ -302,17 +340,36 @@ class RGB_SClusterFormer(nn.Module):
             patch_embed = getattr(self, f"patch_embed2d{i + 1}")
             block = getattr(self, f"block2d{i + 1}")
             norm = getattr(self, f"norm2d{i + 1}")
+            
             x, s = patch_embed(x)
+            
+            # This is a fix for Cluster2D. It needs to know the spatial size.
+            # We must override the patch_size attribute in the attn blocks
+            # because it changes at each stage.
+            for blk in block:
+                # Update the patch_size in the attention module for correct reshaping
+                blk.attn.patch_size = s 
+            
             for blk in block:
                 x = blk(x)
+
             x = norm(x)
+
             if i != self.num_stages - 1:
                 x = x.reshape(B, s, s, -1).permute(0, 3, 1, 2).contiguous()
         return x
 
     def forward(self, x):
-        x = self.deform_conv_layer_rgb(x)
+        # 1. Stem (Now a single, efficient DeformConv2d)
+        x = self.deform_conv_stem(x)
+        
+        # 2. Features
         x = self.forward_features(x)
+
+        # 3. Pooling
         x = x.mean(dim=1)
+        
+        # 4. Classification
         x = self.head(x)
+        
         return x

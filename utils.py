@@ -60,7 +60,7 @@ def get_loaders(data_dir, img_size, batch_size):
     val_sampler = SubsetRandomSampler(val_indices)
 
     # ---
-    # *** FIX ***
+    # KAGGLE FIX:
     # Changed num_workers from 2 to 0 to prevent deadlocks in Kaggle notebooks.
     # ---
     train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, num_workers=0)
