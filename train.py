@@ -16,6 +16,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
     running_loss = 0.0
     running_corrects = 0
 
+    # Determine dataset size (works for SubsetRandomSampler)
+    dataset_size = len(dataloader.dataset.indices)
+
     for inputs, labels in dataloader:
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -32,8 +35,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         running_loss += loss.item() * inputs.size(0)
         running_corrects += torch.sum(preds == labels.data)
 
-    epoch_loss = running_loss / len(dataloader.dataset.indices)
-    epoch_acc = running_corrects.double() / len(dataloader.dataset.indices)
+    epoch_loss = running_loss / dataset_size
+    epoch_acc = running_corrects.double() / dataset_size
     return epoch_loss, epoch_acc.item()
 
 def validate(model, dataloader, criterion, device):
@@ -42,8 +45,8 @@ def validate(model, dataloader, criterion, device):
     running_corrects = 0
 
     # Determine dataset size (works for both Subset and full Dataset)
-    if hasattr(dataloader.dataset, 'indices'):
-        dataset_size = len(dataloader.dataset.indices)
+    if hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'indices'):
+        dataset_size = len(dataloader.sampler.indices)
     else:
         dataset_size = len(dataloader.dataset)
 
@@ -68,7 +71,7 @@ def main(args):
     print(f"Using device: {device}")
 
     # Load Data
-    dataloaders, dataset_sizes, class_names = get_loaders(args.data_path, args.img_size, args.batch_size)
+    dataloaders, _, class_names = get_loaders(args.data_path, args.img_size, args.batch_size)
     num_classes = len(class_names)
 
     # Initialize Model, Loss, and Optimizer
@@ -128,10 +131,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train RGB-SClusterFormer model.')
     parser.add_argument('--data_path', type=str, default="/kaggle/input/apple-disease-dataset/datasets",
                         help='Path to the dataset directory (must contain train/ and test/ folders).')
-    parser.add_l_argument('--img_size', type=int, default=224, help='Input image size.')
+    
+    # --- THIS LINE IS NOW FIXED ---
+    parser.add_argument('--img_size', type=int, default=224, help='Input image size.')
+    
     parser.add_argument('--batch_size', type=int, default=32, help='Training batch size.')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='Learning rate for optimizer.')
     
     args = parser.parse_args()
-    main(args)
+    
+    if not os.path.exists(args.data_path):
+        print(f"Error: Data path not found: {args.data_path}")
+        print("Please check the --data_path argument or the default path in train.py")
+    else:
+        main(args)
